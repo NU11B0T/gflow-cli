@@ -93,6 +93,9 @@ The server registers three protocol surfaces:
 * `gflow_instructions_rm(project, title|card_id, profile)`: Removes one card from the brief.
 * `gflow_instructions_toggle_mode(project, enabled, profile)`: Flips the brief-level master switch; cards are left untouched.
 * `gflow_instructions_apply(project, cards, profile)`: Declarative **full-sync** — REPLACES all cards with the given set (destructive; same entry shape as the CLI `instructions apply` file).
+* `gflow_create_character(project, name, face_prompt, body_prompt, voice, personality, model, format_prompt, locale, profile)`: Creates a Flow Character entity (face + optional body reference images) via the persist-before-spend saga. Runs synchronously — no `wait=False` mode, since character creation is a short multi-step saga rather than a long-poll queue task.
+* `gflow_workflow_list(project)` / `gflow_workflow_get(workflow_id, project)` / `gflow_workflow_save(name, nodes, edges, workflow_id, project)`: Read/write **gflow-director**'s node-graph workflow files (`<app_data_dir>/projects/<project_id>/<workflow_id>.json`) — the same files the [gflow-director](https://github.com/NU11B0T/flow-director) desktop app's canvas reads and writes. `project` defaults to gflow-director's last-active project (its `app_settings.json`) when omitted. See `src/gflow_cli/mcp/workflow_files.py`.
+* `gflow_workflow_run(workflow_id, project, profile)`: Runs every Image/Video/Character node in a gflow-director workflow, in dependency order — resolving each node's prompt/initial-frame from its upstream edges exactly as the gflow-director UI does (`ui/src/store/graphStore.ts`'s `getUpstreamText`/`getUpstreamImagePath`) — and writes each node's `jobId`/`artifactPath`/`entityId` back into the workflow file, so gflow-director's own GUI shows the result. Always runs to completion end-to-end; there is no fire-and-forget mode for a whole-graph run.
 
 CLI↔MCP parity is enforced programmatically: `tests/mcp/test_cli_parity.py` walks every CLI leaf command and fails when one has neither a mapped MCP tool nor an explicit exemption with a stated reason. Note the deliberate asymmetry: `gflow_generate_video` has **no** `instructions` param (unlike `gflow_generate_image`) because the video pipeline (`GenerateVideoRequest` / the worker) has no instructions support — agentic-video is a typed divergence, and a dead parameter would be silently dropped. Both `gflow_generate_image` and `gflow_generate_video` support an `output` parameter mirroring the CLI `-o`/`--output` flag (#414, #415), decoding explicit output destinations in the worker daemon.
 
@@ -187,6 +190,44 @@ Use this if you cloned the repository locally and run it via `uv`:
   }
 }
 ```
+
+### Claude Code Setup
+Register the stdio server with the `claude` CLI directly — no config file editing needed:
+```bash
+claude mcp add gflow -s user -- gflow mcp run
+```
+`-s user` makes it available in every project (not just the one you ran the
+command from). Verify it's actually reachable with `claude mcp get gflow`
+(look for `Status: ✔ Connected`); a newly-added or edited server's tools only
+appear in **new** conversations — reconnecting an existing one requires fully
+quitting and relaunching the `claude` process, not `/mcp` or `/exit` inside
+the same window (those don't restart the process that spawned the MCP
+subprocess).
+
+Two gotchas that show up specifically when `claude`'s own process doesn't
+inherit your interactive shell's environment (e.g. it was launched from a
+service manager, a different login shell, or a remote/headless box):
+
+* **`gflow` not on `PATH` → `ENOENT`.** If `claude mcp get gflow` reports the
+  server as unreachable right after adding it, re-add with the absolute path
+  from `which gflow` instead of the bare command:
+  ```bash
+  claude mcp remove gflow -s user
+  claude mcp add gflow -s user -- "$(which gflow)" mcp run
+  ```
+* **Headed generation needs a real `DISPLAY`.** `gflow`'s browser transport
+  launches Chrome headed (`headless: false` in the incident log at
+  `~/.local/share/gflow-cli/incidents/`); if it exits immediately with a
+  `ProfileLockedError` / "browser exited immediately while launching" and no
+  other Chrome process actually holds the profile (check for a stale
+  `SingletonLock` in `profile_<name>/`), the MCP subprocess most likely has no
+  `DISPLAY` set. Pass it explicitly:
+  ```bash
+  claude mcp add gflow -s user -e DISPLAY=:99 -- "$(which gflow)" mcp run
+  ```
+  (On a normal desktop with a real display this isn't needed — `DISPLAY` is
+  already in your login environment. It only bites when `gflow mcp run` is
+  running under something like Xvfb, a container, or a remote dev box.)
 
 ### Cursor Setup
 1. Open Cursor Settings -> Features -> MCP.
