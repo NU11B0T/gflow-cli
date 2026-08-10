@@ -30,6 +30,7 @@ from typing import Any, cast
 import structlog
 
 from gflow_cli._cli_helpers import _FLOW_ID_RE
+from gflow_cli.api.character import VOICES, CharacterImageRequest
 from gflow_cli.api.client import FlowApiClient
 from gflow_cli.api.image import AgentInstruction
 from gflow_cli.api.video import is_media_uuid
@@ -37,11 +38,22 @@ from gflow_cli.cli_instructions import classify_refs
 from gflow_cli.config import UiMode, get_settings
 from gflow_cli.data.models import AssetLookup
 from gflow_cli.data.queries import list_projects
+from gflow_cli.data.recorder import OperationRecorder
 from gflow_cli.data.repository import DataRepository
 from gflow_cli.data.store import DataStore
 from gflow_cli.errors import GFlowError, is_retryable
 from gflow_cli.mcp.server import server
+from gflow_cli.mcp.workflow_files import (
+    active_project_id,
+    get_workflow,
+    list_workflows,
+    save_workflow,
+    topological_order,
+    upstream_image_path,
+    upstream_text,
+)
 from gflow_cli.profile_store import NoDefaultProfileError, NoProfilesError, resolve_profile
+from gflow_cli.services.character_create import character_create
 from gflow_cli.worker import codec
 from gflow_cli.worker.daemon import FlowWorker
 from gflow_cli.worker.queue import QueueRepository
@@ -1011,6 +1023,483 @@ async def gflow_generate_video(  # NOSONAR
     return result
 
 
+def _normalize_voice_arg(value: str | None) -> str | dict[str, Any] | None:
+    """Validate *value* against the voice catalog case-insensitively.
+
+    Returns the canonical Capitalized voice name, ``None`` if *value* is
+    ``None``, or a ready-to-return bad-parameter error dict if *value* doesn't
+    match any known voice. Mirrors ``cli_character._normalize_voice`` — kept
+    as its own small copy so ``mcp.tools`` doesn't reach into a CLI module for
+    one helper.
+    """
+    if value is None:
+        return None
+    by_lower = {v.name.lower(): v.name for v in VOICES}
+    canonical = by_lower.get(value.strip().lower())
+    if canonical is None:
+        return _bad_param(
+            "Invalid Voice",
+            f"Unknown voice {value!r}. Valid voices: {', '.join(v.name for v in VOICES)}.",
+        )
+    return canonical
+
+
+@server.tool(
+    name="gflow_create_character",
+    description=(
+        "Create a reusable Flow Character entity (face + optional body reference "
+        "images, persisted server-side). Spends image-generation credits for each "
+        "reference image. The character's name becomes referenceable via '@Name' "
+        "mentions in later gflow_generate_image/gflow_generate_video prompts. "
+        "Runs synchronously (no wait=False mode) since character creation is a "
+        "short multi-step saga, not a long-poll queue task."
+    ),
+)
+async def gflow_create_character(
+    project: str,
+    name: str,
+    face_prompt: str,
+    body_prompt: str | None = None,
+    voice: str | None = None,
+    personality: str | None = None,
+    model: str = "nano2",
+    format_prompt: bool = False,
+    locale: str = "en-US",
+    profile: str = _DEFAULT_PROFILE,
+) -> dict[str, Any]:
+    """Create a Character entity in a Flow project.
+
+    Args:
+        project: Flow project id to create the character in (required — a
+            Character is always project-scoped).
+        name: Display name for the character. This is what downstream prompts
+            reference via '@Name'.
+        face_prompt: Prompt describing the character's face/headshot reference
+            image (slot 0). Always generated.
+        body_prompt: Optional prompt for a full-body reference image (slot 1).
+            Omit for a face-only character.
+        voice: Optional preset voice name (see the voice catalog); case-insensitive.
+        personality: Optional personality/style brief attached to the entity.
+        model: Image model alias for the reference generations (e.g. 'nano2').
+        format_prompt: If True, runs the prompt through gflow's agent-mode
+            prompt formatter before generating.
+        locale: Locale tag forwarded to the creation flow.
+        profile: gflow-cli profile name. 'default' auto-resolves like the CLI.
+
+    Returns:
+        Dict with 'status': 'ok' and a 'character' object (entity_id,
+        project_id, name, workflow_ids, primary_media_ids, voice, image_paths),
+        or 'status': 'error' with an RFC 9457 'error' dict.
+    """
+    if (proj_err := _validate_project(project)) is not None:
+        return proj_err
+
+    normalized_voice = _normalize_voice_arg(voice)
+    if isinstance(normalized_voice, dict):
+        return normalized_voice
+
+    if not await _rate_limiter.acquire():
+        log.warning("mcp.tool.rate_limited", tool="gflow_create_character")
+        return {
+            "status": "rate_limited",
+            "error": "Too many requests. Please wait before generating again.",
+        }
+
+    resolved = _resolve_and_validate_profile(profile)
+    if isinstance(resolved, dict):
+        return resolved
+    resolved_profile = resolved
+
+    settings = get_settings()
+    profile_dir = settings.profile_subdir(resolved_profile)
+    log.info(
+        "mcp.tool.create_character",
+        project=project,
+        name=name,
+        model=model,
+        profile=resolved_profile,
+    )
+
+    face = CharacterImageRequest(prompt=face_prompt, model=model, image_reference_index=0)
+    body = (
+        CharacterImageRequest(prompt=body_prompt, model=model, image_reference_index=1)
+        if body_prompt is not None
+        else None
+    )
+
+    try:
+        async with FlowApiClient(profile_dir=profile_dir, headless=settings.headless) as client:
+            recorder = OperationRecorder.open(settings)  # type: ignore[arg-type]
+            try:
+                result = await character_create(
+                    client,
+                    recorder,
+                    profile_name=resolved_profile,
+                    profile_dir=profile_dir,
+                    project_id=project,
+                    name=name,
+                    face=face,
+                    body=body,
+                    voice=normalized_voice,
+                    personality=personality,
+                    locale=locale,
+                    format_prompt=format_prompt,
+                )
+            finally:
+                recorder.close()
+    except GFlowError as exc:
+        log.error("mcp.tool.create_character_gflow_error", error=str(exc))
+        return _error_payload(_gflow_error_dict(exc))
+    except Exception as exc:
+        log.exception("mcp.tool.create_character_unexpected_error", exc_info=exc)
+        return _error_payload(
+            {
+                "type": "https://gflow-cli.dev/errors/unknown",
+                "title": "Unexpected Error",
+                "status": 500,
+                "detail": str(exc),
+            }
+        )
+
+    return {
+        "status": "ok",
+        "character": {
+            "entity_id": result.entity_id,
+            "project_id": result.project_id,
+            "name": result.name,
+            "workflow_ids": list(result.workflow_ids),
+            "primary_media_ids": list(result.primary_media_ids),
+            "voice": result.voice,
+            "image_paths": [str(p) if p is not None else None for p in result.image_paths],
+        },
+    }
+
+
+def _resolve_workflow_project(project: str | None) -> str | dict[str, Any]:
+    """Resolve *project* to a Flow project id, falling back to the GUI's last
+    active project (``app_settings.json``'s ``activeProjectId``) when omitted.
+    Returns a bad-parameter error dict if neither is available.
+    """
+    resolved = project or active_project_id()
+    if resolved is None:
+        return _bad_param(
+            "Missing Project Id",
+            "'project' was not given and no active gflow-director project was "
+            "found (app_settings.json has no activeProjectId). Pass 'project' "
+            "explicitly, or open gflow-director once so it binds a project.",
+        )
+    if (proj_err := _validate_project(resolved)) is not None:
+        return proj_err
+    return resolved
+
+
+@server.tool(
+    name="gflow_workflow_list",
+    description=(
+        "List gflow-director workflows (node-graph pipelines) saved for a project. "
+        "Reads the same <workflow_id>.json files the gflow-director GUI reads/writes, "
+        "so this sees workflows built in the app and vice versa."
+    ),
+)
+async def gflow_workflow_list(project: str | None = None) -> dict[str, Any]:
+    """List workflows for a project, newest-updated first.
+
+    Args:
+        project: Flow project id. Omit to use gflow-director's last active
+            project (read from its app_settings.json).
+
+    Returns:
+        Dict with 'status', 'project', and 'workflows' (each: id, name, updatedAt).
+    """
+    resolved = _resolve_workflow_project(project)
+    if isinstance(resolved, dict):
+        return resolved
+
+    summaries = list_workflows(resolved)
+    return {
+        "status": "ok",
+        "project": resolved,
+        "workflows": [{"id": s.id, "name": s.name, "updatedAt": s.updated_at} for s in summaries],
+    }
+
+
+@server.tool(
+    name="gflow_workflow_get",
+    description=(
+        "Fetch a gflow-director workflow's full node graph (nodes + edges) by id. "
+        "Node shapes: text ({text}), image ({model,aspect,count,jobId,artifactPath,...}), "
+        "video ({model,aspect,duration,count,jobId,artifactPath,...}), character "
+        "({name,facePrompt,bodyPrompt,voice,model,jobId,artifactPath,entityId,...}). "
+        "Edges connect via sourceHandle/targetHandle: a Text node's 'text' handle "
+        "feeds an Image/Video node's 'prompt' handle; an Image node's 'image' handle "
+        "feeds a Video node's 'initialFrame' handle."
+    ),
+)
+async def gflow_workflow_get(workflow_id: str, project: str | None = None) -> dict[str, Any]:
+    """Fetch one workflow's full nodes/edges.
+
+    Args:
+        workflow_id: The workflow's id (from gflow_workflow_list or gflow_workflow_save).
+        project: Flow project id. Omit to use gflow-director's last active project.
+
+    Returns:
+        Dict with 'status' and 'workflow' ({id, name, updatedAt, nodes, edges}),
+        or 'status': 'error' if not found.
+    """
+    resolved = _resolve_workflow_project(project)
+    if isinstance(resolved, dict):
+        return resolved
+
+    wf = get_workflow(resolved, workflow_id)
+    if wf is None:
+        return {
+            "status": "error",
+            "error": {
+                "type": "https://gflow-cli.dev/errors/not-found",
+                "title": "Workflow Not Found",
+                "status": 404,
+                "detail": f"No workflow {workflow_id!r} in project {resolved!r}.",
+            },
+        }
+    return {"status": "ok", "project": resolved, "workflow": wf.to_json_dict()}
+
+
+@server.tool(
+    name="gflow_workflow_save",
+    description=(
+        "Create or overwrite a gflow-director workflow's node graph. Omit "
+        "workflow_id to create a new workflow (a fresh id is generated); pass an "
+        "existing workflow_id to overwrite it in place. Writes the same "
+        "<workflow_id>.json file the GUI reads, so the result is immediately "
+        "visible/editable there. See gflow_workflow_get's description for the "
+        "node/edge shape."
+    ),
+)
+async def gflow_workflow_save(
+    name: str,
+    nodes: list[dict[str, Any]] | None = None,
+    edges: list[dict[str, Any]] | None = None,
+    workflow_id: str | None = None,
+    project: str | None = None,
+) -> dict[str, Any]:
+    """Create (workflow_id omitted) or overwrite (workflow_id given) a workflow.
+
+    Args:
+        name: Display name for the workflow.
+        nodes: Full node list (see gflow_workflow_get for shapes). Omit/empty for
+            a blank workflow.
+        edges: Full edge list connecting node handles. Omit/empty for no connections.
+        workflow_id: Existing workflow id to overwrite. Omitted = create new.
+        project: Flow project id. Omit to use gflow-director's last active project.
+
+    Returns:
+        Dict with 'status': 'ok' and the saved 'workflow' ({id, name, updatedAt,
+        nodes, edges}).
+    """
+    resolved = _resolve_workflow_project(project)
+    if isinstance(resolved, dict):
+        return resolved
+
+    wid = workflow_id or str(uuid.uuid4())
+    wf = save_workflow(resolved, wid, name, nodes or [], edges or [])
+    log.info(
+        "mcp.tool.workflow_save", project=resolved, workflow_id=wid, created=workflow_id is None
+    )
+    return {"status": "ok", "project": resolved, "workflow": wf.to_json_dict()}
+
+
+def _node_error(node_id: str, node_type: str | None, detail: str) -> dict[str, Any]:
+    return {"node_id": node_id, "node_type": node_type, "error": detail}
+
+
+@server.tool(
+    name="gflow_workflow_run",
+    description=(
+        "Run every generation node in a gflow-director workflow, in dependency "
+        "order, resolving each node's inputs from its upstream edges (a Text "
+        "node's text feeds a connected Image/Video node's prompt; an Image "
+        "node's output feeds a connected Video node's initialFrame, making it "
+        "i2v instead of t2v). Text nodes are inputs only (no generation runs "
+        "for them). Character nodes run standalone (no edges). Writes each "
+        "node's resulting jobId/artifactPath/entityId back into the workflow "
+        "file, so gflow-director's GUI shows the same results. Always runs "
+        "every node to completion before its dependents start — there is no "
+        "fire-and-forget mode for a whole-graph run, since a downstream node "
+        "needs its upstream node's actual output, not a pending handle."
+    ),
+)
+async def gflow_workflow_run(
+    workflow_id: str,
+    project: str | None = None,
+    profile: str = _DEFAULT_PROFILE,
+) -> dict[str, Any]:
+    """Run a workflow's Image/Video/Character nodes in dependency order.
+
+    Args:
+        workflow_id: The workflow to run (from gflow_workflow_list/save).
+        project: Flow project id. Omit to use gflow-director's last active project.
+        profile: gflow-cli profile name. 'default' auto-resolves like the CLI.
+
+    Returns:
+        Dict with 'status' ('ok' or 'partial_failure'), the updated 'workflow'
+        (same shape as gflow_workflow_get, with results written into node data),
+        'node_results' (per-node generation results, keyed by node id), and
+        'failures' (list of {node_id, node_type, error} for any node that
+        couldn't run — e.g. an Image node with no upstream Text prompt).
+    """
+    resolved = _resolve_workflow_project(project)
+    if isinstance(resolved, dict):
+        return resolved
+
+    wf = get_workflow(resolved, workflow_id)
+    if wf is None:
+        return {
+            "status": "error",
+            "error": {
+                "type": "https://gflow-cli.dev/errors/not-found",
+                "title": "Workflow Not Found",
+                "status": 404,
+                "detail": f"No workflow {workflow_id!r} in project {resolved!r}.",
+            },
+        }
+
+    nodes_by_id: dict[str, dict[str, Any]] = {n["id"]: n for n in wf.nodes}
+    order = topological_order(wf.nodes, wf.edges)
+    if order is None:
+        return {
+            "status": "error",
+            "error": {
+                "type": "https://gflow-cli.dev/errors/cycle-detected",
+                "title": "Cycle Detected",
+                "status": 400,
+                "detail": "This workflow's prompt/initialFrame edges form a cycle.",
+            },
+        }
+
+    log.info("mcp.tool.workflow_run", project=resolved, workflow_id=workflow_id, nodes=len(order))
+
+    node_results: dict[str, Any] = {}
+    node_updates: dict[str, dict[str, Any]] = {}
+    failures: list[dict[str, Any]] = []
+
+    for node_id in order:
+        node = nodes_by_id[node_id]
+        node_type = node.get("type")
+        data = node.get("data", {})
+
+        if node_type == "text":
+            continue  # a Text node IS its data — nothing to generate
+
+        if node_type == "character":
+            face_prompt = data.get("facePrompt")
+            if not face_prompt:
+                failures.append(_node_error(node_id, node_type, "missing facePrompt"))
+                continue
+            result = await gflow_create_character(
+                project=resolved,
+                name=data.get("name") or "Character",
+                face_prompt=face_prompt,
+                body_prompt=data.get("bodyPrompt") or None,
+                voice=data.get("voice") or None,
+                model=data.get("model") or "nano2",
+                profile=profile,
+            )
+            node_results[node_id] = result
+            if result.get("status") == "ok":
+                character = result["character"]
+                image_paths: list[Any] = character.get("image_paths") or []
+                node_updates[node_id] = {
+                    "entityId": character.get("entity_id"),
+                    "artifactPath": image_paths[0] if image_paths else None,
+                }
+            else:
+                failures.append(_node_error(node_id, node_type, str(result.get("error"))))
+            continue
+
+        if node_type == "image":
+            prompt = upstream_text(node_id, nodes_by_id, wf.edges)
+            if not prompt:
+                failures.append(
+                    _node_error(node_id, node_type, "no upstream Text node wired to 'prompt'")
+                )
+                continue
+            result = await gflow_generate_image(
+                prompt=prompt,
+                model=data.get("model") or "nano2",
+                aspect=data.get("aspect") or "1:1",
+                count=int(data.get("count") or 1),
+                profile=profile,
+                project=resolved,
+            )
+            node_results[node_id] = result
+            if result.get("status") == "completed":
+                files: list[Any] = result.get("files") or []
+                node_updates[node_id] = {
+                    "jobId": result.get("task_id"),
+                    "artifactPath": files[0] if files else None,
+                }
+            else:
+                failures.append(
+                    _node_error(
+                        node_id, node_type, str(result.get("error") or result.get("status"))
+                    )
+                )
+            continue
+
+        if node_type == "video":
+            prompt = upstream_text(node_id, nodes_by_id, wf.edges)
+            if not prompt:
+                failures.append(
+                    _node_error(node_id, node_type, "no upstream Text node wired to 'prompt'")
+                )
+                continue
+            initial_frame = upstream_image_path(node_id, nodes_by_id, wf.edges)
+            duration = data.get("duration")
+            result = await gflow_generate_video(
+                prompt=prompt,
+                mode="i2v" if initial_frame else "t2v",
+                aspect=data.get("aspect") or "16:9",
+                initial_frame=initial_frame,
+                model=data.get("model") or None,
+                duration=int(duration) if duration is not None else None,
+                count=int(data.get("count") or 1),
+                profile=profile,
+                project=resolved,
+            )
+            node_results[node_id] = result
+            if result.get("status") == "completed":
+                files: list[Any] = result.get("files") or []
+                node_updates[node_id] = {
+                    "jobId": result.get("task_id"),
+                    "artifactPath": files[0] if files else None,
+                }
+            else:
+                failures.append(
+                    _node_error(
+                        node_id, node_type, str(result.get("error") or result.get("status"))
+                    )
+                )
+            continue
+
+        failures.append(_node_error(node_id, node_type, f"unknown node type {node_type!r}"))
+
+    patched_nodes = [
+        {**node, "data": {**node.get("data", {}), **node_updates[node["id"]]}}
+        if node["id"] in node_updates
+        else node
+        for node in wf.nodes
+    ]
+    saved = save_workflow(resolved, workflow_id, wf.name, patched_nodes, wf.edges)
+
+    return {
+        "status": "ok" if not failures else "partial_failure",
+        "project": resolved,
+        "workflow": saved.to_json_dict(),
+        "node_results": node_results,
+        "failures": failures,
+    }
+
+
 @server.tool(
     name="gflow_list_tools",
     description="List available gflow prompt tools (name, title, description, category).",
@@ -1517,6 +2006,11 @@ async def gflow_instructions_apply(
 __all__ = [
     "gflow_generate_image",
     "gflow_generate_video",
+    "gflow_create_character",
+    "gflow_workflow_list",
+    "gflow_workflow_get",
+    "gflow_workflow_save",
+    "gflow_workflow_run",
     "gflow_list_tools",
     "gflow_list_projects",
     "gflow_list_characters",
