@@ -21,7 +21,6 @@ import re
 import secrets
 import time
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import urlparse
 
 import structlog
 
@@ -30,6 +29,7 @@ from gflow_cli.api.character import CHARACTER_MODELS, CharacterImageRequest
 from gflow_cli.api.dto import BatchSubmissionResult, GeneratedImage
 from gflow_cli.api.image import Aspect, GenerateImageRequest, Model
 from gflow_cli.api.transports._common import extract_project_id
+from gflow_cli.api.transports._download import download_images, is_allowed_download_host
 from gflow_cli.api.transports.drivers.factory import AGENT_TUNE_INDICATOR_SELECTOR
 from gflow_cli.api.transports.ui_automation_video import (
     COMPOSER_AGENT_TOGGLE_SELECTOR,
@@ -141,20 +141,12 @@ _ALLOWED_DOWNLOAD_HOST_SUFFIXES: tuple[str, ...] = (
 def _is_allowed_download_host(url: str) -> bool:
     """True if ``url``'s host ends with one of the allowed Google domains.
 
-    Refuses URLs that lack a host or use a non-https scheme — both shapes
-    are unexpected for Flow-issued fifeUrls and treating them as suspect
-    is safer than treating them as trustworthy.
+    Thin delegate to the shared, transport-agnostic
+    :func:`gflow_cli.api.transports._download.is_allowed_download_host` —
+    kept as a module-level function here (rather than inlined at the one
+    call site) because existing tests reference it by this name.
     """
-    try:
-        parsed = urlparse(url)
-    except (ValueError, TypeError):
-        return False
-    if parsed.scheme != "https" or not parsed.hostname:
-        return False
-    host = parsed.hostname.lower()
-    return any(
-        host == suffix or host.endswith("." + suffix) for suffix in _ALLOWED_DOWNLOAD_HOST_SUFFIXES
-    )
+    return is_allowed_download_host(url, _ALLOWED_DOWNLOAD_HOST_SUFFIXES)
 
 
 async def _capture_debug_screenshot(
@@ -2389,59 +2381,18 @@ class UiAutomationTransport(VideoGenerationMixin):
     ) -> list[Path]:
         """Download each URL into ``out_dir`` using session cookies.
 
-        Saves to ``out_dir / image_NN.png`` (zero-padded index). Individual
-        download failures are logged and skipped — the function returns the
-        list of paths that DID write successfully.
-
-        URLs whose host is not in :data:`_ALLOWED_DOWNLOAD_HOST_SUFFIXES`
-        are skipped before any HTTP request is made — this prevents
-        session cookies from being forwarded to a non-Google host through
-        a malicious or compromised fifeUrl. Redirects are also disabled
-        (``follow_redirects=False``) so an open-redirect on an allowed
-        host cannot rebound the request to a third party.
+        Thin delegate to the shared, transport-agnostic
+        :func:`gflow_cli.api.transports._download.download_images` — kept as
+        a staticmethod here (rather than called directly by callers) because
+        existing tests invoke ``UiAutomationTransport._download(...)``.
         """
-        import httpx  # local import — httpx is a runtime dependency
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-        paths: list[Path] = []
-        async with httpx.AsyncClient(
-            timeout=30.0,
-            follow_redirects=False,
-            cookies=cookies,
-        ) as client:
-            for i, url in enumerate(urls):
-                if not _is_allowed_download_host(url):
-                    log.error(
-                        "ui_automation.download_host_rejected",
-                        url=url,
-                        allowed_suffixes=list(_ALLOWED_DOWNLOAD_HOST_SUFFIXES),
-                    )
-                    continue
-                try:
-                    resp = await client.get(url)
-                    resp.raise_for_status()
-                    # Auto-detect extension from Content-Type / magic bytes.
-                    ct = resp.headers.get("content-type", "")
-                    if "jpeg" in ct or "jpg" in ct or resp.content[:3] == b"\xff\xd8\xff":
-                        ext = ".jpg"
-                    else:
-                        ext = ".png"
-                    p = out_dir / f"image_{i:02d}{ext}"
-                    p.write_bytes(resp.content)
-                    paths.append(p)
-                    log.info(
-                        "ui_automation.image_saved",
-                        path=str(p),
-                        bytes=len(resp.content),
-                        format=ext,
-                    )
-                except Exception as e:
-                    log.exception(
-                        "ui_automation.download_failed",
-                        url=url,
-                        error=str(e),
-                    )
-        return paths
+        return await download_images(
+            urls,
+            out_dir,
+            cookies,
+            allowed_host_suffixes=_ALLOWED_DOWNLOAD_HOST_SUFFIXES,
+            log_prefix="ui_automation",
+        )
 
     # ------------------------------------------------------------------
     # Protocol — generate_images (unit 3.9)

@@ -1175,6 +1175,295 @@ async def gflow_create_character(
     }
 
 
+# ---------------------------------------------------------------------------
+# Codex-CLI-backed writer tools (Character Writer / Location Writer / Scenes)
+# ---------------------------------------------------------------------------
+
+
+async def _run_codex_writer(system_prompt: str, user_prompt: str) -> str | dict[str, Any]:
+    """Shell out to the Codex CLI off the event loop; return text or an error dict."""
+    from gflow_cli.tools.codex_cli import CodexCliError, run_codex_prompt
+
+    try:
+        return await asyncio.to_thread(run_codex_prompt, system_prompt, user_prompt)
+    except CodexCliError as exc:
+        log.error("mcp.tool.codex_cli_error", error=str(exc))
+        return _error_payload(
+            {
+                "type": "https://gflow-cli.dev/errors/codex-cli",
+                "title": "Codex CLI Error",
+                "status": 502,
+                "detail": str(exc),
+            }
+        )
+
+
+@server.tool(
+    name="gflow_write_character",
+    description=(
+        "Generate a character description from a brief via the Codex CLI. Backs "
+        "the Character Writer node — its output feeds a Character Sheet node's "
+        "'prompt' handle."
+    ),
+)
+async def gflow_write_character(brief: str) -> dict[str, Any]:
+    """Write a character description from *brief* using the Codex CLI.
+
+    Args:
+        brief: Free-form character brief (who they are, role, vibe).
+
+    Returns:
+        Dict with 'status': 'ok' and 'text', or 'status': 'error' with an
+        RFC 9457 'error' dict.
+    """
+    from gflow_cli.tools.codex_cli import character_writer_prompt
+
+    system, user = character_writer_prompt(brief)
+    result = await _run_codex_writer(system, user)
+    if isinstance(result, dict):
+        return result
+    return {"status": "ok", "text": result}
+
+
+@server.tool(
+    name="gflow_write_location",
+    description=(
+        "Generate a location description from a brief via the Codex CLI. Backs "
+        "the Location Writer node — its output feeds a Location Sheet node's "
+        "'prompt' handle."
+    ),
+)
+async def gflow_write_location(brief: str) -> dict[str, Any]:
+    """Write a location description from *brief* using the Codex CLI.
+
+    Args:
+        brief: Free-form location brief (setting, mood, era).
+
+    Returns:
+        Dict with 'status': 'ok' and 'text', or 'status': 'error' with an
+        RFC 9457 'error' dict.
+    """
+    from gflow_cli.tools.codex_cli import location_writer_prompt
+
+    system, user = location_writer_prompt(brief)
+    result = await _run_codex_writer(system, user)
+    if isinstance(result, dict):
+        return result
+    return {"status": "ok", "text": result}
+
+
+@server.tool(
+    name="gflow_write_scenes",
+    description=(
+        "Break a brief into a list of scenes via the Codex CLI. Backs the Scenes "
+        "node — returns the scene list for display only; it does NOT create any "
+        "nodes/edges. Use gflow_workflow_save separately to add a Text node per "
+        "scene you want wired into an image/video node."
+    ),
+)
+async def gflow_write_scenes(brief: str, scene_count: int | None = None) -> dict[str, Any]:
+    """Break *brief* into a list of scenes using the Codex CLI.
+
+    Args:
+        brief: Free-form story/brief to break into scenes.
+        scene_count: Optional exact scene count. Omit to let Codex decide.
+
+    Returns:
+        Dict with 'status': 'ok' and 'scenes' (list[str]), or 'status': 'error'
+        with an RFC 9457 'error' dict.
+    """
+    from gflow_cli.tools.codex_cli import parse_scenes, scenes_prompt
+
+    system, user = scenes_prompt(brief, scene_count)
+    result = await _run_codex_writer(system, user)
+    if isinstance(result, dict):
+        return result
+    return {"status": "ok", "scenes": parse_scenes(result)}
+
+
+# ---------------------------------------------------------------------------
+# chatgpt.com-backed sheet tools (Character Sheet / Location Sheet)
+# ---------------------------------------------------------------------------
+
+
+async def _generate_sheet(
+    *,
+    kind: str,
+    prompt: str,
+    model: str,
+    aspect: str,
+    count: int,
+    profile: str,
+) -> dict[str, Any]:
+    """Shared body for gflow_generate_character_sheet/gflow_generate_location_sheet.
+
+    Runs synchronously against a dedicated chatgpt.com Chrome profile (see
+    ``chatgpt_profile_dir`` — never the Google Flow profile), same
+    non-queued call shape as ``gflow_create_character``. ``model``/``aspect``
+    are accepted for schema symmetry with ``gflow_generate_image`` and echoed
+    back in ``params``, but chatgpt.com's image tool doesn't expose those as
+    separate knobs — the only generation control is the prompt itself (which
+    already carries the fixed 3-panel instruction, see
+    ``chatgpt_ui_automation.build_sheet_prompt``).
+    """
+    from gflow_cli.api.transports.chatgpt_ui_automation import (
+        ChatGptUiAutomationTransport,
+        build_sheet_prompt,
+        chatgpt_profile_dir,
+    )
+
+    if not prompt.strip():
+        return _bad_param("Missing Prompt", "'prompt' must be non-empty.")
+
+    if not await _rate_limiter.acquire():
+        log.warning("mcp.tool.rate_limited", tool=f"gflow_generate_{kind}_sheet")
+        return {
+            "status": "rate_limited",
+            "error": "Too many requests. Please wait before generating again.",
+        }
+
+    resolved = _resolve_and_validate_profile(profile)
+    if isinstance(resolved, dict):
+        return resolved
+    resolved_profile = resolved
+
+    settings = get_settings()
+    profile_dir = chatgpt_profile_dir(resolved_profile)
+    out_dir = settings.output_dir / f"{kind}_sheets" / str(uuid.uuid4())
+    full_prompt = build_sheet_prompt(prompt)
+
+    log.info(
+        "mcp.tool.generate_sheet",
+        kind=kind,
+        profile=resolved_profile,
+        model=model,
+        aspect=aspect,
+        count=count,
+    )
+
+    transport = ChatGptUiAutomationTransport()
+    try:
+        await transport.setup(profile_dir)
+        files: list[str] = []
+        for _ in range(max(1, count)):
+            paths = await transport.generate_sheet_image(prompt=full_prompt, out_dir=out_dir)
+            files.extend(str(p) for p in paths)
+    except GFlowError as exc:
+        log.error(f"mcp.tool.generate_{kind}_sheet_gflow_error", error=str(exc))
+        return _error_payload(_gflow_error_dict(exc))
+    except Exception as exc:
+        log.exception(f"mcp.tool.generate_{kind}_sheet_unexpected_error", exc_info=exc)
+        return _error_payload(
+            {
+                "type": "https://gflow-cli.dev/errors/unknown",
+                "title": "Unexpected Error",
+                "status": 500,
+                "detail": str(exc),
+            }
+        )
+    finally:
+        await transport.teardown()
+
+    if not files:
+        return {
+            "status": "error",
+            "error": {
+                "type": "https://gflow-cli.dev/errors/no-files",
+                "title": "No Sheet Image Produced",
+                "status": 502,
+                "detail": (
+                    "chatgpt.com automation completed without producing a "
+                    "downloadable image — see chatgpt_ui_automation.py's "
+                    "TODO(chatgpt-selectors)/TODO(chatgpt-network-filter) notes."
+                ),
+            },
+        }
+
+    return {
+        "status": "completed",
+        "files": files,
+        "params": {"prompt": prompt, "model": model, "aspect": aspect, "count": count},
+    }
+
+
+@server.tool(
+    name="gflow_generate_character_sheet",
+    description=(
+        "Generate a 3-panel character turnaround image (front/side/3-quarter view) "
+        "from a character description, via a chatgpt.com browser-automation "
+        "transport (real logged-in Chrome profile, network-response capture, "
+        "download) mirroring gflow_generate_image's Google Flow transport. Backs "
+        "the Character Sheet node."
+    ),
+)
+async def gflow_generate_character_sheet(
+    prompt: str,
+    model: str = "nano2",
+    aspect: str = "1:1",
+    count: int = 1,
+    profile: str = _DEFAULT_PROFILE,
+) -> dict[str, Any]:
+    """Generate a character sheet image from *prompt* via chatgpt.com.
+
+    Args:
+        prompt: Character description text (typically a Character Writer
+            node's output) — the 3-panel instruction is added automatically.
+        model: Accepted for schema symmetry with gflow_generate_image; echoed
+            in 'params' but not applied (chatgpt.com exposes no model knob).
+        aspect: Accepted for schema symmetry; echoed in 'params', not applied.
+        count: Number of sheet images to generate sequentially.
+        profile: gflow-cli profile name; resolves a *dedicated* chatgpt.com
+            Chrome profile (see chatgpt_profile_dir), independent of the
+            Google Flow profile of the same name.
+
+    Returns:
+        Dict with 'status': 'completed' and 'files' (local image paths), or
+        'status': 'error'/'rate_limited' with details.
+    """
+    return await _generate_sheet(
+        kind="character", prompt=prompt, model=model, aspect=aspect, count=count, profile=profile
+    )
+
+
+@server.tool(
+    name="gflow_generate_location_sheet",
+    description=(
+        "Generate a 3-panel location turnaround image (front/side/3-quarter view) "
+        "from a location description, via a chatgpt.com browser-automation "
+        "transport (real logged-in Chrome profile, network-response capture, "
+        "download) mirroring gflow_generate_image's Google Flow transport. Backs "
+        "the Location Sheet node."
+    ),
+)
+async def gflow_generate_location_sheet(
+    prompt: str,
+    model: str = "nano2",
+    aspect: str = "1:1",
+    count: int = 1,
+    profile: str = _DEFAULT_PROFILE,
+) -> dict[str, Any]:
+    """Generate a location sheet image from *prompt* via chatgpt.com.
+
+    Args:
+        prompt: Location description text (typically a Location Writer
+            node's output) — the 3-panel instruction is added automatically.
+        model: Accepted for schema symmetry with gflow_generate_image; echoed
+            in 'params' but not applied (chatgpt.com exposes no model knob).
+        aspect: Accepted for schema symmetry; echoed in 'params', not applied.
+        count: Number of sheet images to generate sequentially.
+        profile: gflow-cli profile name; resolves a *dedicated* chatgpt.com
+            Chrome profile (see chatgpt_profile_dir), independent of the
+            Google Flow profile of the same name.
+
+    Returns:
+        Dict with 'status': 'completed' and 'files' (local image paths), or
+        'status': 'error'/'rate_limited' with details.
+    """
+    return await _generate_sheet(
+        kind="location", prompt=prompt, model=model, aspect=aspect, count=count, profile=profile
+    )
+
+
 def _resolve_workflow_project(project: str | None) -> str | dict[str, Any]:
     """Resolve *project* to a Flow project id, falling back to the GUI's last
     active project (``app_settings.json``'s ``activeProjectId``) when omitted.
@@ -1473,6 +1762,76 @@ async def gflow_workflow_run(
                     "jobId": result.get("task_id"),
                     "artifactPath": files[0] if files else None,
                 }
+            else:
+                failures.append(
+                    _node_error(
+                        node_id, node_type, str(result.get("error") or result.get("status"))
+                    )
+                )
+            continue
+
+        if node_type in ("characterWriter", "locationWriter"):
+            brief = data.get("brief")
+            if not brief:
+                failures.append(_node_error(node_id, node_type, "missing brief"))
+                continue
+            writer = gflow_write_character if node_type == "characterWriter" else gflow_write_location
+            result = await writer(brief=brief)
+            node_results[node_id] = result
+            if result.get("status") == "ok":
+                node_updates[node_id] = {"text": result.get("text")}
+            else:
+                failures.append(_node_error(node_id, node_type, str(result.get("error"))))
+            continue
+
+        if node_type == "scenes":
+            brief = data.get("brief")
+            if not brief:
+                failures.append(_node_error(node_id, node_type, "missing brief"))
+                continue
+            scene_count = data.get("sceneCount")
+            result = await gflow_write_scenes(
+                brief=brief,
+                scene_count=int(scene_count) if scene_count else None,
+            )
+            node_results[node_id] = result
+            if result.get("status") == "ok":
+                # Only the node's own data is patched — no new nodes/edges are
+                # created here. Scene notes are added on demand from the UI
+                # (Scenes node's per-scene "+ Add note" button), never
+                # auto-generated by a run.
+                node_updates[node_id] = {"scenes": result.get("scenes")}
+            else:
+                failures.append(_node_error(node_id, node_type, str(result.get("error"))))
+            continue
+
+        if node_type in ("characterSheet", "locationSheet"):
+            prompt = upstream_text(node_id, nodes_by_id, wf.edges)
+            if not prompt:
+                failures.append(
+                    _node_error(
+                        node_id,
+                        node_type,
+                        "no upstream Text/Character-Writer/Location-Writer node wired to 'prompt'",
+                    )
+                )
+                continue
+            sheet_tool = (
+                gflow_generate_character_sheet
+                if node_type == "characterSheet"
+                else gflow_generate_location_sheet
+            )
+            result = await sheet_tool(
+                prompt=prompt,
+                model=data.get("model") or "nano2",
+                aspect=data.get("aspect") or "1:1",
+                count=int(data.get("count") or 1),
+                profile=profile,
+            )
+            node_results[node_id] = result
+            if result.get("status") == "completed":
+                files: list[Any] = result.get("files") or []
+                node_updates[node_id] = {"artifactPath": files[0] if files else None}
             else:
                 failures.append(
                     _node_error(
