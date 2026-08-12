@@ -210,6 +210,17 @@ def _write(project_id: str, wf: WorkflowFile) -> None:
 
 _DEPENDENCY_HANDLES = ("prompt", "initialFrame")
 
+#: Node types whose 'text' source handle produces prose usable as an
+#: upstream 'prompt' input — the original Text node plus the two Codex-CLI
+#: writer nodes, which store their generated output in the same `data.text`
+#: field. Mirrors graphStore.ts::getUpstreamText's widened type check.
+_TEXT_SOURCE_TYPES = ("text", "characterWriter", "locationWriter")
+
+#: Node types whose 'image' source handle produces a usable upstream image
+#: path — the original Image node plus the two chatgpt.com-backed sheet
+#: nodes. Mirrors graphStore.ts::getUpstreamImagePath's widened type check.
+_IMAGE_SOURCE_TYPES = ("image", "characterSheet", "locationSheet")
+
 
 def topological_order(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[str] | None:
     """Return node ids in an order where every dependency runs before its
@@ -254,15 +265,15 @@ def upstream_text(
     edges: list[dict[str, Any]],
 ) -> str | None:
     """The text feeding *node_id*'s 'prompt' handle, or ``None`` if there's no
-    such edge or its source isn't a Text node. Mirrors
-    ``graphStore.ts::getUpstreamText``."""
+    such edge or its source isn't a Text/Character-Writer/Location-Writer
+    node. Mirrors ``graphStore.ts::getUpstreamText``."""
     for edge in edges:
         source_id = edge.get("source")
         if not isinstance(source_id, str):
             continue
         if edge.get("target") == node_id and edge.get("targetHandle") == "prompt":
             source = nodes_by_id.get(source_id)
-            if source is not None and source.get("type") == "text":
+            if source is not None and source.get("type") in _TEXT_SOURCE_TYPES:
                 text = source.get("data", {}).get("text")
                 return text if isinstance(text, str) else None
     return None
@@ -274,7 +285,8 @@ def upstream_image_path(
     edges: list[dict[str, Any]],
 ) -> str | None:
     """The image path feeding *node_id*'s 'initialFrame' handle, or ``None`` if
-    there's no such edge or its source isn't an Image node. Prefers a
+    there's no such edge or its source isn't an Image/Character-Sheet/
+    Location-Sheet node. Prefers a
     user-imported ``localFilePath`` over a generated ``artifactPath``, same
     priority as ``graphStore.ts::getUpstreamImagePath`` (minus its in-memory
     ``runStore`` lookup, which has nothing to read outside a live GUI session —
@@ -286,7 +298,7 @@ def upstream_image_path(
             continue
         if edge.get("target") == node_id and edge.get("targetHandle") == "initialFrame":
             source = nodes_by_id.get(source_id)
-            if source is not None and source.get("type") == "image":
+            if source is not None and source.get("type") in _IMAGE_SOURCE_TYPES:
                 data = source.get("data", {})
                 local = data.get("localFilePath")
                 if isinstance(local, str) and local:
